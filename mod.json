@@ -1,0 +1,13 @@
+{
+  "name": "USB Import",
+  "id": "usb-import",
+  "version": "7.0.0",
+  "description": "Import music files from USB drives to the internal SATA drive with on-screen dialog, progress display, automatic database registration and playlist creation.",
+  "author": "DJ MR. BROWN",
+  "license": "MIT",
+  "sourceUrl": "https://github.com/Frequenzbetrieb/enginex-usb-import",
+  "script": "start.sh",
+  "qmlFiles": {
+    "UsbImportDialog.qml": "Skins/Embedded/Items/MessageBoxes/DriveMigrationDialog.qml"
+  }
+}

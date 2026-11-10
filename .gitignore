@@ -1,0 +1,5 @@
+usb-import-aarch64
+usb-import-arm32
+sqlite-amalgamation-*/
+*.zip
+*.tar.gz
