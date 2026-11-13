@@ -2,11 +2,12 @@ import QtQuick 2.15
 import Planck 1.0
 
 Item {
-    id: usbImportRoot
+    id: root
     property bool importInProgress: false
     property bool waitingForResult: false
     property string importingDrive: ""
     property int watchdogMisses: 0
+    property string pendingDrive: ""
 
     Timer {
         id: pollTimer
@@ -14,14 +15,14 @@ Item {
         running: true
         repeat: true
         onTriggered: {
-            if (usbImportRoot.waitingForResult) {
+            if (root.waitingForResult)
                 checkProgress()
-            } else if (!usbImportRoot.importInProgress) {
+            else if (!root.importInProgress)
                 checkNewDrive()
-            }
         }
     }
 
+    /* Step 1: Poll for new USB drive */
     function checkNewDrive() {
         var xhr = new XMLHttpRequest()
         xhr.open("GET", "http://127.0.0.1:8082/api/status")
@@ -30,115 +31,154 @@ Item {
             if (xhr.readyState === XMLHttpRequest.DONE && xhr.status === 200) {
                 try {
                     var data = JSON.parse(xhr.responseText)
-                    if (data.select_target) {
-                        showTargetPrompt(data.candidates, 0)
-                    } else if (data.new_drive) {
-                        showImportDialog(data.new_drive)
-                    }
+                    if (data.new_drive)
+                        askImport(data.new_drive)
                 } catch(e) {}
             }
         }
         xhr.send()
     }
 
-    function showTargetPrompt(candidates, index) {
-        if (index >= candidates.length) {
-            return
-        }
+    /* Step 1: "Import music?" Yes/No */
+    function askImport(driveName) {
         importInProgress = true
-        var isLast = (index === candidates.length - 1)
-        var options = [
-            { text: "Yes, use this", role: Prompt.AcceptRole }
-        ]
-        if (!isLast) {
-            options.push({ text: "No, next", role: Prompt.RejectRole })
-        } else {
-            options.push({ text: "Cancel", role: Prompt.RejectRole })
-        }
-
-        var prompt = PlanckGUI.views.prompts.post({
-            title: "Select Target Drive",
-            message: "Is '" + candidates[index] + "' your internal drive?\n\nImported music will be stored here.",
-            options: options
-        })
-        prompt.finished.connect(function(role) {
-            if (role === Prompt.AcceptRole) {
-                showRememberPrompt(candidates[index])
-            } else if (!isLast) {
-                showTargetPrompt(candidates, index + 1)
-            } else {
-                importInProgress = false
-            }
-        })
-    }
-
-    function showRememberPrompt(driveName) {
-        var prompt = PlanckGUI.views.prompts.post({
-            title: "Remember Choice?",
-            message: "Save '" + driveName + "' as target drive?\n\nReset later: http://<deck-ip>:8082/api/reset-target",
-            options: [
-                { text: "Save", role: Prompt.AcceptRole },
-                { text: "Just this time", role: Prompt.RejectRole }
-            ]
-        })
-        prompt.finished.connect(function(role) {
-            selectTarget(driveName, role === Prompt.AcceptRole)
-            importInProgress = false
-        })
-    }
-
-    function selectTarget(driveName, remember) {
-        var xhr = new XMLHttpRequest()
-        xhr.open("POST", "http://127.0.0.1:8082/api/select-target")
-        xhr.setRequestHeader("Content-Type", "application/json")
-        xhr.send(JSON.stringify({drive: driveName, remember: remember}))
-    }
-
-    function showImportDialog(driveName) {
-        importInProgress = true
-        importingDrive = driveName
+        pendingDrive = driveName
         var prompt = PlanckGUI.views.prompts.post({
             title: "USB Drive Detected",
-            message: "'" + driveName + "' was connected.\n\nImport music files to internal drive?",
+            message: "'" + driveName + "' connected.\n\nImport music to internal drive?",
             options: [
                 { text: "Import", role: Prompt.AcceptRole },
                 { text: "Ignore", role: Prompt.RejectRole }
             ]
         })
         prompt.finished.connect(function(role) {
-            if (role === Prompt.AcceptRole) {
-                startImport(driveName)
-            } else {
+            if (role === Prompt.AcceptRole)
+                tryStartImport(driveName)
+            else {
                 dismissDrive(driveName)
                 importInProgress = false
-                importingDrive = ""
+                pendingDrive = ""
             }
         })
     }
 
-    function startImport(driveName) {
-        watchdogMisses = 0
-        PlanckGUI.views.prompts.post({
-            id: "UsbImporting",
-            title: "Importing...",
-            message: "Scanning '" + driveName + "' for music files...",
-            options: []
-        })
+    /* Step 2: Try to start import — server returns needs_target if no target set */
+    function tryStartImport(driveName) {
         var xhr = new XMLHttpRequest()
         xhr.open("POST", "http://127.0.0.1:8082/api/import")
         xhr.setRequestHeader("Content-Type", "application/json")
         xhr.timeout = 5000
         xhr.onerror = function() {
-            PlanckGUI.views.prompts.drop("UsbImporting")
-            showError("Could not start import — daemon not responding.")
+            showError("Daemon not responding.")
         }
         xhr.ontimeout = function() {
-            PlanckGUI.views.prompts.drop("UsbImporting")
             showError("Import request timed out.")
         }
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState === XMLHttpRequest.DONE && xhr.status === 200) {
+                try {
+                    var data = JSON.parse(xhr.responseText)
+                    if (data.needs_target) {
+                        showTargetSelection(driveName, data.candidates, 0)
+                    } else if (data.ok) {
+                        importingDrive = driveName
+                        showProgressDialog(driveName)
+                        waitingForResult = true
+                        pollTimer.interval = 1500
+                    }
+                } catch(e) {
+                    showError("Unexpected response.")
+                }
+            }
+        }
         xhr.send(JSON.stringify({drive: driveName}))
-        waitingForResult = true
-        pollTimer.interval = 1500
+    }
+
+    /* Step 2b: Target selection — cycle through candidates */
+    function showTargetSelection(usbDrive, candidates, index) {
+        if (!candidates || candidates.length === 0) {
+            showError("No internal drive with Engine Library found.")
+            return
+        }
+        if (index >= candidates.length) {
+            importInProgress = false
+            pendingDrive = ""
+            return
+        }
+
+        var list = ""
+        for (var i = 0; i < candidates.length; i++) {
+            if (i === index)
+                list += "> " + candidates[i] + " (internal?)\n"
+            else
+                list += "   " + candidates[i] + "\n"
+        }
+
+        var msg = "Select internal hard drive:\n\n" + list
+
+        var isLast = (index === candidates.length - 1)
+        var prompt = PlanckGUI.views.prompts.post({
+            title: "Select Target",
+            message: msg,
+            options: [
+                { text: candidates[index], role: Prompt.AcceptRole },
+                { text: isLast ? "Cancel" : "Next", role: Prompt.RejectRole }
+            ]
+        })
+        prompt.finished.connect(function(role) {
+            if (role === Prompt.AcceptRole)
+                askRemember(usbDrive, candidates[index])
+            else if (!isLast)
+                showTargetSelection(usbDrive, candidates, index + 1)
+            else {
+                importInProgress = false
+                pendingDrive = ""
+            }
+        })
+    }
+
+    /* Step 2c: Remember as default? */
+    function askRemember(usbDrive, targetDrive) {
+        var prompt = PlanckGUI.views.prompts.post({
+            title: "Remember?",
+            message: "Always use '" + targetDrive + "'?\n\nReset in Mod Hub.",
+            options: [
+                { text: "Remember", role: Prompt.AcceptRole },
+                { text: "Just once", role: Prompt.RejectRole }
+            ]
+        })
+        prompt.finished.connect(function(role) {
+            selectTargetAndImport(usbDrive, targetDrive, role === Prompt.AcceptRole)
+        })
+    }
+
+    /* Step 2d: Select target, then start import */
+    function selectTargetAndImport(usbDrive, targetDrive, remember) {
+        var xhr = new XMLHttpRequest()
+        xhr.open("POST", "http://127.0.0.1:8082/api/select-target")
+        xhr.setRequestHeader("Content-Type", "application/json")
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState === XMLHttpRequest.DONE) {
+                tryStartImport(usbDrive)
+            }
+        }
+        xhr.send(JSON.stringify({drive: targetDrive, remember: remember}))
+    }
+
+    /* Step 3: Progress dialog */
+    function showProgressDialog(driveName) {
+        watchdogMisses = 0
+        PlanckGUI.views.prompts.post({
+            id: "UsbImporting",
+            title: "Importing...",
+            message: "Scanning '" + driveName + "' for music...",
+            options: [
+                { text: "Cancel", role: Prompt.RejectRole }
+            ]
+        }).finished.connect(function(role) {
+            if (role === Prompt.RejectRole && root.waitingForResult)
+                cancelImport()
+        })
     }
 
     function checkProgress() {
@@ -149,10 +189,7 @@ Item {
         xhr.ontimeout = function() { handleWatchdog() }
         xhr.onreadystatechange = function() {
             if (xhr.readyState === XMLHttpRequest.DONE) {
-                if (xhr.status !== 200) {
-                    handleWatchdog()
-                    return
-                }
+                if (xhr.status !== 200) { handleWatchdog(); return }
                 watchdogMisses = 0
                 try {
                     var data = JSON.parse(xhr.responseText)
@@ -173,7 +210,12 @@ Item {
                             id: "UsbImporting",
                             title: "Importing...",
                             message: msg,
-                            options: []
+                            options: [
+                                { text: "Cancel", role: Prompt.RejectRole }
+                            ]
+                        }).finished.connect(function(role) {
+                            if (role === Prompt.RejectRole && root.waitingForResult)
+                                cancelImport()
                         })
                     } else if (data.done) {
                         waitingForResult = false
@@ -182,28 +224,27 @@ Item {
                         ackDone()
 
                         if (data.error && data.error.length > 0) {
-                            importInProgress = false
-                            importingDrive = ""
                             showError(data.error)
                         } else if (data.restart_pending) {
                             showRestartDialog(data)
                         } else {
                             importInProgress = false
                             importingDrive = ""
-                            var msg2 = buildResultMessage(data)
+                            pendingDrive = ""
+                            var msg2 = buildResult(data)
                             PlanckGUI.views.prompts.post({
                                 title: "Import Complete",
                                 message: msg2,
                                 options: [{ text: "OK", role: Prompt.AcceptRole }]
                             })
                         }
-                    } else if (data.idle) {
+                    } else if (data.idle || data.new_drive) {
                         waitingForResult = false
                         pollTimer.interval = 3000
                         PlanckGUI.views.prompts.drop("UsbImporting")
                         importInProgress = false
                         importingDrive = ""
-                        showError("Import was interrupted unexpectedly.")
+                        pendingDrive = ""
                     }
                 } catch(e) {}
             }
@@ -219,15 +260,16 @@ Item {
             PlanckGUI.views.prompts.drop("UsbImporting")
             importInProgress = false
             importingDrive = ""
+            pendingDrive = ""
             showError("Lost connection to import daemon.")
             watchdogMisses = 0
         }
     }
 
+    /* Step 4: Restart dialog */
     function showRestartDialog(data) {
-        var msg = buildResultMessage(data)
-        msg += "\n\nRestart EngineX to see imported tracks?\nPlayback will stop."
-        var restartPrompt = PlanckGUI.views.prompts.post({
+        var msg = buildResult(data) + "\n\nRestart EngineX to see tracks?\nPlayback will stop."
+        var prompt = PlanckGUI.views.prompts.post({
             title: "Import Complete",
             message: msg,
             options: [
@@ -235,18 +277,18 @@ Item {
                 { text: "Later", role: Prompt.RejectRole }
             ]
         })
-        restartPrompt.finished.connect(function(role) {
+        prompt.finished.connect(function(role) {
             importInProgress = false
             importingDrive = ""
-            if (role === Prompt.AcceptRole) {
+            pendingDrive = ""
+            if (role === Prompt.AcceptRole)
                 restartEngine()
-            } else {
+            else
                 notifyLater()
-            }
         })
     }
 
-    function buildResultMessage(data) {
+    function buildResult(data) {
         var msg = ""
         if (data.files_copied > 0)
             msg += data.files_copied + " files copied"
@@ -261,25 +303,33 @@ Item {
         if (msg.length === 0)
             msg = "No music files found."
         else
-            msg += "\nTracks registered in collection."
+            msg += "\nTracks added to collection."
         return msg
     }
 
     function showError(message) {
         importInProgress = false
         importingDrive = ""
+        pendingDrive = ""
         PlanckGUI.views.prompts.post({
-            title: "Import Failed",
+            title: "Import Error",
             message: message,
             options: [{ text: "OK", role: Prompt.AcceptRole }]
         })
     }
 
+    /* API calls */
     function dismissDrive(driveName) {
         var xhr = new XMLHttpRequest()
         xhr.open("POST", "http://127.0.0.1:8082/api/dismiss")
         xhr.setRequestHeader("Content-Type", "application/json")
         xhr.send(JSON.stringify({drive: driveName}))
+    }
+
+    function cancelImport() {
+        var xhr = new XMLHttpRequest()
+        xhr.open("POST", "http://127.0.0.1:8082/api/cancel")
+        xhr.send()
     }
 
     function ackDone() {

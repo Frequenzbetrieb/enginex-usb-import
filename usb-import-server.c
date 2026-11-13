@@ -1,7 +1,9 @@
 /*
- * USB Import Daemon v7.0 for EngineX OS
+ * USB Import Daemon v8.0 for EngineX OS
  * Listens on 127.0.0.1:8082, polls /media/ for USB drives.
  * MIT License — DJ MR. BROWN
+ *
+ * Flow: USB detected → "Import?" → target selection (if needed) → copy → DB → restart
  */
 
 #define _GNU_SOURCE
@@ -39,7 +41,231 @@ typedef struct {
     char *rel_path;   /* e.g. "Music/Artist/song.mp3" */
     char *file_type;  /* e.g. "mp3" */
     int   skipped;    /* 1 if file already existed */
+    long long file_bytes;
+    /* ID3 metadata */
+    char title[256];
+    char artist[256];
+    char album[256];
+    char genre[256];
+    int  year;
+    int  bitrate;     /* kbps */
+    int  duration;    /* seconds */
+    /* Cover art */
+    unsigned char *cover_data;
+    int cover_size;
+    unsigned char cover_hash[20];
 } CopiedFile;
+
+/* ── ID3 Tag Reader ── */
+
+static unsigned int id3_syncsafe(const unsigned char *b) {
+    return ((unsigned int)b[0] << 21) | ((unsigned int)b[1] << 14) |
+           ((unsigned int)b[2] << 7)  | (unsigned int)b[3];
+}
+
+static unsigned int id3_be32(const unsigned char *b) {
+    return ((unsigned int)b[0] << 24) | ((unsigned int)b[1] << 16) |
+           ((unsigned int)b[2] << 8)  | (unsigned int)b[3];
+}
+
+static void cover_hash(const unsigned char *data, int size, unsigned char out[20]) {
+    /* Simple hash: DJB2 spread across 20 bytes */
+    memset(out, 0, 20);
+    if (!data || size <= 0) return;
+    unsigned long h = 5381;
+    for (int i = 0; i < size; i++) {
+        h = ((h << 5) + h) + data[i];
+        out[i % 20] ^= (unsigned char)(h & 0xFF);
+    }
+}
+
+static void id3v2_read_text(const unsigned char *data, int size, char *out, int outsz) {
+    if (size < 1) return;
+    int enc = data[0];
+    const unsigned char *txt = data + 1;
+    int txtlen = size - 1;
+    if (txtlen <= 0) return;
+
+    if (enc == 0 || enc == 3) {
+        /* ISO-8859-1 or UTF-8 */
+        int n = txtlen < outsz - 1 ? txtlen : outsz - 1;
+        memcpy(out, txt, n);
+        out[n] = 0;
+    } else if (enc == 1 || enc == 2) {
+        /* UTF-16 with or without BOM — extract ASCII portion */
+        int start = 0;
+        if (txtlen >= 2 && ((txt[0] == 0xFF && txt[1] == 0xFE) || (txt[0] == 0xFE && txt[1] == 0xFF)))
+            start = 2;
+        int le = (start >= 2 && txt[0] == 0xFF);
+        int j = 0;
+        for (int i = start; i + 1 < txtlen && j < outsz - 1; i += 2) {
+            unsigned char lo = le ? txt[i] : txt[i+1];
+            unsigned char hi = le ? txt[i+1] : txt[i];
+            if (lo == 0 && hi == 0) break;
+            if (hi == 0 && lo >= 0x20)
+                out[j++] = (char)lo;
+            else if (hi == 0)
+                break;
+        }
+        out[j] = 0;
+    }
+}
+
+static void id3v2_read_apic(const unsigned char *data, int size,
+                            unsigned char **out_data, int *out_size) {
+    if (size < 4) return;
+    int enc = data[0];
+    (void)enc;
+    const unsigned char *p = data + 1;
+    const unsigned char *end = data + size;
+    /* Skip MIME type (null-terminated) */
+    while (p < end && *p) p++;
+    if (p >= end) return;
+    p++; /* skip null */
+    if (p >= end) return;
+    /* Picture type byte */
+    p++;
+    if (p >= end) return;
+    /* Skip description (null-terminated, encoding-dependent) */
+    while (p < end && *p) p++;
+    if (p >= end) return;
+    p++; /* skip null */
+    int img_size = (int)(end - p);
+    if (img_size <= 0) return;
+    *out_data = malloc(img_size);
+    if (*out_data) {
+        memcpy(*out_data, p, img_size);
+        *out_size = img_size;
+    }
+}
+
+/* MP3 bitrate table for MPEG1 Layer3 */
+static const int mp3_bitrates[16] = {
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
+};
+static const int mp3_samplerates[4] = { 44100, 48000, 32000, 0 };
+
+static void read_id3_tags(const char *filepath, CopiedFile *cf) {
+    FILE *f = fopen(filepath, "rb");
+    if (!f) return;
+
+    unsigned char hdr[10];
+    if (fread(hdr, 1, 10, f) != 10) { fclose(f); return; }
+
+    /* ID3v2 header */
+    if (hdr[0] == 'I' && hdr[1] == 'D' && hdr[2] == '3') {
+        unsigned int tag_size = id3_syncsafe(hdr + 6);
+        unsigned char *tag_data = malloc(tag_size);
+        if (!tag_data) { fclose(f); return; }
+        if (fread(tag_data, 1, tag_size, f) != tag_size) {
+            free(tag_data); fclose(f); return;
+        }
+        int ver = hdr[3]; /* 3 = ID3v2.3, 4 = ID3v2.4 */
+        unsigned int pos = 0;
+        while (pos + 10 <= tag_size) {
+            char fid[5] = {0};
+            memcpy(fid, tag_data + pos, 4);
+            if (fid[0] == 0) break;
+            unsigned int fsize;
+            if (ver >= 4)
+                fsize = id3_syncsafe(tag_data + pos + 4);
+            else
+                fsize = id3_be32(tag_data + pos + 4);
+            /* unsigned int flags = (tag_data[pos+8] << 8) | tag_data[pos+9]; */
+            pos += 10;
+            if (fsize == 0 || pos + fsize > tag_size) break;
+
+            if (strcmp(fid, "TIT2") == 0)
+                id3v2_read_text(tag_data + pos, fsize, cf->title, sizeof(cf->title));
+            else if (strcmp(fid, "TPE1") == 0)
+                id3v2_read_text(tag_data + pos, fsize, cf->artist, sizeof(cf->artist));
+            else if (strcmp(fid, "TALB") == 0)
+                id3v2_read_text(tag_data + pos, fsize, cf->album, sizeof(cf->album));
+            else if (strcmp(fid, "TCON") == 0)
+                id3v2_read_text(tag_data + pos, fsize, cf->genre, sizeof(cf->genre));
+            else if (strcmp(fid, "TDRC") == 0 || strcmp(fid, "TYER") == 0) {
+                char ybuf[32] = {0};
+                id3v2_read_text(tag_data + pos, fsize, ybuf, sizeof(ybuf));
+                cf->year = atoi(ybuf);
+            } else if (strcmp(fid, "APIC") == 0 && !cf->cover_data) {
+                id3v2_read_apic(tag_data + pos, fsize,
+                               &cf->cover_data, &cf->cover_size);
+            }
+            pos += fsize;
+        }
+
+        /* Try to read MP3 frame header for bitrate/duration after ID3v2 tag */
+        long id3end = 10 + (long)tag_size;
+        fseek(f, id3end, SEEK_SET);
+        unsigned char fb[4];
+        if (fread(fb, 1, 4, f) == 4 && fb[0] == 0xFF && (fb[1] & 0xE0) == 0xE0) {
+            int br_idx = (fb[2] >> 4) & 0x0F;
+            int sr_idx = (fb[2] >> 2) & 0x03;
+            if (br_idx > 0 && br_idx < 15 && sr_idx < 3) {
+                cf->bitrate = mp3_bitrates[br_idx];
+                fseek(f, 0, SEEK_END);
+                long fsize_l = ftell(f);
+                long audio_size = fsize_l - id3end;
+                if (audio_size > 0 && cf->bitrate > 0)
+                    cf->duration = (int)(audio_size / (cf->bitrate * 125));
+            }
+        }
+        free(tag_data);
+    } else {
+        /* Try ID3v1 at end of file */
+        fseek(f, -128, SEEK_END);
+        unsigned char v1[128];
+        if (fread(v1, 1, 128, f) == 128 && v1[0] == 'T' && v1[1] == 'A' && v1[2] == 'G') {
+            if (!cf->title[0]) {
+                int n = 30; while (n > 0 && (v1[3+n-1] == ' ' || v1[3+n-1] == 0)) n--;
+                if (n > 0) { memcpy(cf->title, v1+3, n); cf->title[n] = 0; }
+            }
+            if (!cf->artist[0]) {
+                int n = 30; while (n > 0 && (v1[33+n-1] == ' ' || v1[33+n-1] == 0)) n--;
+                if (n > 0) { memcpy(cf->artist, v1+33, n); cf->artist[n] = 0; }
+            }
+            if (!cf->album[0]) {
+                int n = 30; while (n > 0 && (v1[63+n-1] == ' ' || v1[63+n-1] == 0)) n--;
+                if (n > 0) { memcpy(cf->album, v1+63, n); cf->album[n] = 0; }
+            }
+            if (!cf->year) {
+                char ybuf[5] = {0};
+                memcpy(ybuf, v1+93, 4);
+                cf->year = atoi(ybuf);
+            }
+        }
+        /* Try to get bitrate from MP3 header at start */
+        fseek(f, 0, SEEK_SET);
+        unsigned char fb[4];
+        if (fread(fb, 1, 4, f) == 4 && fb[0] == 0xFF && (fb[1] & 0xE0) == 0xE0) {
+            int br_idx = (fb[2] >> 4) & 0x0F;
+            int sr_idx = (fb[2] >> 2) & 0x03;
+            if (br_idx > 0 && br_idx < 15 && sr_idx < 3) {
+                cf->bitrate = mp3_bitrates[br_idx];
+                fseek(f, 0, SEEK_END);
+                long fsize_l = ftell(f);
+                if (fsize_l > 0 && cf->bitrate > 0)
+                    cf->duration = (int)(fsize_l / (cf->bitrate * 125));
+            }
+        }
+    }
+
+    /* Fallback: use filename as title */
+    if (!cf->title[0] && cf->rel_path) {
+        const char *fn = strrchr(cf->rel_path, '/');
+        fn = fn ? fn + 1 : cf->rel_path;
+        const char *dot = strrchr(fn, '.');
+        int n = dot ? (int)(dot - fn) : (int)strlen(fn);
+        if (n > (int)sizeof(cf->title) - 1) n = sizeof(cf->title) - 1;
+        memcpy(cf->title, fn, n);
+        cf->title[n] = 0;
+    }
+
+    if (cf->cover_data && cf->cover_size > 0)
+        cover_hash(cf->cover_data, cf->cover_size, cf->cover_hash);
+
+    fclose(f);
+}
 
 static CopiedFile *g_copied = NULL;
 static int g_copied_count = 0;
@@ -60,7 +286,7 @@ static long g_bytes_copied;
 static char g_current_file[512];
 static char g_error_msg[512];
 static char g_backup_path[512];
-static int  g_done_acked;  /* 1 after client has seen done result */
+static int  g_done_acked;
 
 /* Pending drive for import dialog */
 static char g_pending_drive[256];
@@ -69,12 +295,6 @@ static char g_pending_path[1024];
 /* Internal drive (selected by user or auto) */
 static char g_internal_root[1024];  /* e.g. "/media/Denon" */
 static char g_saved_target[256];    /* saved target drive name */
-
-/* Drive candidates for selection dialog */
-#define MAX_CANDIDATES 8
-static char g_candidates[MAX_CANDIDATES][256];
-static int  g_candidate_count;
-static int  g_needs_target_selection;
 
 /* Known drives (already seen/imported) */
 static char g_known[MAX_KNOWN][256];
@@ -138,7 +358,6 @@ static int is_known(const char *name) {
     return 0;
 }
 
-/* Remove drives that are no longer mounted */
 static void purge_unmounted_known(void) {
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_known_count; ) {
@@ -148,7 +367,6 @@ static void purge_unmounted_known(void) {
         if (stat(path, &st) != 0) {
             g_known_count--;
             memmove(g_known[i], g_known[g_known_count], 256);
-            /* don't increment i */
         } else {
             i++;
         }
@@ -165,16 +383,15 @@ static void load_saved_target(void) {
     g_saved_target[0] = 0;
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = 0;
-        if (strncmp(line, "target=", 7) == 0) {
+        if (strncmp(line, "target=", 7) == 0)
             snprintf(g_saved_target, sizeof(g_saved_target), "%s", line + 7);
-        }
     }
     fclose(f);
 }
 
 static void save_target(const char *name) {
     FILE *f = fopen(CONFIG_PATH, "w");
-    if (!f) { fprintf(stderr, "Cannot save config: %s\n", strerror(errno)); return; }
+    if (!f) return;
     fprintf(f, "target=%s\n", name);
     fclose(f);
     snprintf(g_saved_target, sizeof(g_saved_target), "%s", name);
@@ -183,40 +400,30 @@ static void save_target(const char *name) {
 
 /* ── Drive detection ── */
 
-/* Check if a block device path contains /usb (indicating USB attachment) */
 static int is_usb_device(const char *devname) {
-    char syspath[512];
-    /* Strip partition number to get base device */
     char base[64];
     snprintf(base, sizeof(base), "%s", devname);
-    /* Remove trailing digits for partition (e.g. sda1 -> sda) */
     int len = strlen(base);
     while (len > 0 && base[len-1] >= '0' && base[len-1] <= '9') len--;
     base[len] = 0;
 
-    /* Check /sys/block/<dev>/removable */
+    char syspath[512];
     snprintf(syspath, sizeof(syspath), "/sys/block/%s/removable", base);
     FILE *f = fopen(syspath, "r");
     if (f) {
         int val = 0;
-        if (fscanf(f, "%d", &val) == 1 && val == 1) {
-            fclose(f);
-            return 1;
-        }
+        if (fscanf(f, "%d", &val) == 1 && val == 1) { fclose(f); return 1; }
         fclose(f);
     }
 
-    /* Resolve the sysfs path and check if it contains /usb */
     snprintf(syspath, sizeof(syspath), "/sys/block/%s", base);
     char resolved[1024];
-    if (realpath(syspath, resolved)) {
+    if (realpath(syspath, resolved))
         if (strstr(resolved, "/usb")) return 1;
-    }
 
     return 0;
 }
 
-/* Find the device name for a mount point from /proc/mounts */
 static int get_mount_device(const char *mountpoint, char *devname, int devsize) {
     FILE *f = fopen("/proc/mounts", "r");
     if (!f) return 0;
@@ -225,10 +432,9 @@ static int get_mount_device(const char *mountpoint, char *devname, int devsize) 
         char dev[256], mp[512];
         if (sscanf(line, "%255s %511s", dev, mp) == 2) {
             if (strcmp(mp, mountpoint) == 0) {
-                /* Extract base device name from /dev/sdXN */
-                const char *base = strrchr(dev, '/');
-                base = base ? base + 1 : dev;
-                snprintf(devname, devsize, "%s", base);
+                const char *b = strrchr(dev, '/');
+                b = b ? b + 1 : dev;
+                snprintf(devname, devsize, "%s", b);
                 fclose(f);
                 return 1;
             }
@@ -238,7 +444,8 @@ static int get_mount_device(const char *mountpoint, char *devname, int devsize) 
     return 0;
 }
 
-/* Scan for drives with Engine Library DB, return candidates */
+#define MAX_CANDIDATES 8
+
 static int find_engine_drives(char candidates[][256], int max) {
     int count = 0;
     DIR *d = opendir("/media");
@@ -249,24 +456,20 @@ static int find_engine_drives(char candidates[][256], int max) {
         char dbpath[1024];
         snprintf(dbpath, sizeof(dbpath), "/media/%s/Engine Library/Database2/m.db", e->d_name);
         struct stat st;
-        if (stat(dbpath, &st) == 0 && st.st_size > 0) {
+        if (stat(dbpath, &st) == 0 && st.st_size > 0)
             snprintf(candidates[count++], 256, "%s", e->d_name);
-        }
     }
     closedir(d);
     return count;
 }
 
-/* Filter out USB-attached drives from candidate list */
 static int filter_non_usb(char candidates[][256], int count) {
     int out = 0;
     for (int i = 0; i < count; i++) {
         char mp[512], devname[64];
         snprintf(mp, sizeof(mp), "/media/%s", candidates[i]);
-        if (get_mount_device(mp, devname, sizeof(devname)) && is_usb_device(devname)) {
-            fprintf(stderr, "Excluding USB device: %s (%s)\n", candidates[i], devname);
+        if (get_mount_device(mp, devname, sizeof(devname)) && is_usb_device(devname))
             continue;
-        }
         if (i != out) snprintf(candidates[out], 256, "%s", candidates[i]);
         out++;
     }
@@ -316,7 +519,6 @@ static int copy_file_safe(const char *src, const char *dst) {
     return 0;
 }
 
-/* Create parent directories */
 static void mkdirs(const char *path) {
     char tmp[1024];
     snprintf(tmp, sizeof(tmp), "%s", path);
@@ -329,15 +531,13 @@ static void mkdirs(const char *path) {
     }
 }
 
-/* Generate unique destination, checking content via size comparison */
 static void unique_dest(char *dst, int dsz, const char *base_dir,
                         const char *rel, off_t src_size) {
     snprintf(dst, dsz, "%s/%s", base_dir, rel);
     struct stat st;
-    if (lstat(dst, &st) != 0) return; /* does not exist, use as-is */
-    if (st.st_size == src_size) return; /* same size, treat as same file */
+    if (lstat(dst, &st) != 0) return;
+    if (st.st_size == src_size) return;
 
-    /* Find stem and extension */
     const char *dot = strrchr(rel, '.');
     char stem[512], ext[64];
     if (dot) {
@@ -352,11 +552,10 @@ static void unique_dest(char *dst, int dsz, const char *base_dir,
     for (int n = 2; n < 1000; n++) {
         snprintf(dst, dsz, "%s/%s (%d)%s", base_dir, stem, n, ext);
         if (lstat(dst, &st) != 0) return;
-        if (st.st_size == src_size) return; /* existing (N) copy matches */
+        if (st.st_size == src_size) return;
     }
 }
 
-/* Recursively scan and copy music files */
 static void copy_music_recursive(const char *src_base, const char *dst_base,
                                  const char *rel, int depth) {
     if (depth > MAX_RECURSE_DEPTH) return;
@@ -402,31 +601,25 @@ static void copy_music_recursive(const char *src_base, const char *dst_base,
         snprintf(music_rel, sizeof(music_rel), "Music/%s", relpath);
 
         char dst[1024];
-        unique_dest(dst, sizeof(dst),
-                    dst_base, /* e.g. "/media/Denon/Engine Library" */
-                    music_rel, st.st_size);
+        unique_dest(dst, sizeof(dst), dst_base, music_rel, st.st_size);
 
-        /* Track the file for DB registration */
-        /* Compute the relative path from Engine Library dir */
-        const char *db_rel = dst + strlen(dst_base) + 1; /* skip base + / */
+        const char *db_rel = dst + strlen(dst_base) + 1;
 
         int skipped = 0;
         struct stat dst_st;
         if (lstat(dst, &dst_st) == 0 && dst_st.st_size == st.st_size) {
-            /* File already exists with same size — skip copy but register */
             skipped = 1;
             pthread_mutex_lock(&g_lock);
             g_files_skipped++;
             pthread_mutex_unlock(&g_lock);
         } else {
-            /* Create parent dirs and copy */
             mkdirs(dst);
             if (copy_file_safe(fullsrc, dst) != 0) {
                 pthread_mutex_lock(&g_lock);
                 g_files_failed++;
                 pthread_mutex_unlock(&g_lock);
                 fprintf(stderr, "Copy failed: %s\n", relpath);
-                continue; /* don't register failed copies */
+                continue;
             }
             pthread_mutex_lock(&g_lock);
             g_files_copied++;
@@ -434,7 +627,7 @@ static void copy_music_recursive(const char *src_base, const char *dst_base,
             pthread_mutex_unlock(&g_lock);
         }
 
-        /* Add to copied list for DB registration (both copied and skipped) */
+        /* Add to copied list for DB registration */
         pthread_mutex_lock(&g_lock);
         if (g_copied_count >= g_copied_cap) {
             int newcap = g_copied_cap ? g_copied_cap * 2 : 256;
@@ -442,9 +635,14 @@ static void copy_music_recursive(const char *src_base, const char *dst_base,
             if (tmp) { g_copied = tmp; g_copied_cap = newcap; }
         }
         if (g_copied_count < g_copied_cap) {
+            memset(&g_copied[g_copied_count], 0, sizeof(CopiedFile));
             g_copied[g_copied_count].rel_path = strdup(db_rel);
             g_copied[g_copied_count].file_type = strdup(get_extension(e->d_name));
             g_copied[g_copied_count].skipped = skipped;
+            g_copied[g_copied_count].file_bytes = (long long)st.st_size;
+            pthread_mutex_unlock(&g_lock);
+            read_id3_tags(skipped ? fullsrc : dst, &g_copied[g_copied_count]);
+            pthread_mutex_lock(&g_lock);
             g_copied_count++;
         }
         pthread_mutex_unlock(&g_lock);
@@ -455,7 +653,6 @@ static void copy_music_recursive(const char *src_base, const char *dst_base,
 /* ── Backup with write lock ── */
 
 static int backup_database(sqlite3 *db, const char *db_path, char *backup_out, int bsz) {
-    /* Use SQLite backup API while holding the write lock */
     char ts[64];
     time_t now = time(NULL);
     struct tm *t = gmtime(&now);
@@ -467,14 +664,12 @@ static int backup_database(sqlite3 *db, const char *db_path, char *backup_out, i
 
     sqlite3 *dst_db = NULL;
     if (sqlite3_open(backup_path, &dst_db) != SQLITE_OK) {
-        fprintf(stderr, "Cannot open backup dest: %s\n", sqlite3_errmsg(dst_db));
         if (dst_db) sqlite3_close(dst_db);
         return -1;
     }
 
     sqlite3_backup *bk = sqlite3_backup_init(dst_db, "main", db, "main");
     if (!bk) {
-        fprintf(stderr, "Backup init failed: %s\n", sqlite3_errmsg(dst_db));
         sqlite3_close(dst_db);
         unlink(backup_path);
         return -1;
@@ -485,7 +680,6 @@ static int backup_database(sqlite3 *db, const char *db_path, char *backup_out, i
     sqlite3_close(dst_db);
 
     if (rc != SQLITE_DONE) {
-        fprintf(stderr, "Backup step failed: rc=%d\n", rc);
         unlink(backup_path);
         return -1;
     }
@@ -494,7 +688,6 @@ static int backup_database(sqlite3 *db, const char *db_path, char *backup_out, i
     return 0;
 }
 
-/* Remove old backups, keep only the latest N */
 static void rotate_backups(const char *db_path, int keep) {
     char dir[1024], base[256];
     snprintf(dir, sizeof(dir), "%s", db_path);
@@ -507,22 +700,19 @@ static void rotate_backups(const char *db_path, int keep) {
     snprintf(prefix, sizeof(prefix), "%s.usb-import-backup-", base);
     int plen = strlen(prefix);
 
-    /* Collect backup filenames */
     char backups[32][256];
     int count = 0;
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) && count < 32) {
-        if (strncmp(e->d_name, prefix, plen) == 0) {
+        if (strncmp(e->d_name, prefix, plen) == 0)
             snprintf(backups[count++], 256, "%s", e->d_name);
-        }
     }
     closedir(d);
 
     if (count <= keep) return;
 
-    /* Sort by name (timestamp is in the name, so lexicographic = chronological) */
     for (int i = 0; i < count - 1; i++)
         for (int j = i + 1; j < count; j++)
             if (strcmp(backups[i], backups[j]) > 0) {
@@ -532,7 +722,6 @@ static void rotate_backups(const char *db_path, int keep) {
                 memcpy(backups[j], tmp, 256);
             }
 
-    /* Remove oldest, keep the last 'keep' */
     for (int i = 0; i < count - keep; i++) {
         char fullpath[1024];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, backups[i]);
@@ -549,7 +738,6 @@ static void *import_thread(void *arg) {
     char usb_path[1024];
     snprintf(usb_path, sizeof(usb_path), "/media/%s", drive_name);
 
-    /* Determine internal drive */
     pthread_mutex_lock(&g_lock);
     char internal[1024];
     snprintf(internal, sizeof(internal), "%s", g_internal_root);
@@ -579,7 +767,7 @@ static void *import_thread(void *arg) {
             g_importing = 0;
             g_import_done = 1;
             snprintf(g_error_msg, sizeof(g_error_msg),
-                "Not enough free space on internal drive (%llu MB).",
+                "Not enough free space (%llu MB).",
                 avail / (1024 * 1024));
             pthread_mutex_unlock(&g_lock);
             free(drive_name);
@@ -587,12 +775,21 @@ static void *import_thread(void *arg) {
         }
     }
 
-    /* Copy files first */
+    /* Copy files */
     pthread_mutex_lock(&g_lock);
     g_copied_count = 0;
     pthread_mutex_unlock(&g_lock);
 
-    copy_music_recursive(usb_path, el_dir, "", 0);
+    /* If USB has Engine Library/Music/, scan from there to avoid double-nesting */
+    char usb_music[1024];
+    snprintf(usb_music, sizeof(usb_music), "%s/Engine Library/Music", usb_path);
+    struct stat usb_music_st;
+    const char *scan_src = usb_path;
+    if (stat(usb_music, &usb_music_st) == 0 && S_ISDIR(usb_music_st.st_mode)) {
+        scan_src = usb_music;
+        fprintf(stderr, "USB has Engine Library/Music/ — scanning from there\n");
+    }
+    copy_music_recursive(scan_src, el_dir, "", 0);
 
     pthread_mutex_lock(&g_lock);
     int total_for_db = g_copied_count;
@@ -603,14 +800,10 @@ static void *import_thread(void *arg) {
     fprintf(stderr, "Copy done: %d copied, %d skipped, %d for DB\n",
             copied, skipped, total_for_db);
 
-    /* If nothing to register, we're done */
     if (total_for_db == 0) {
         pthread_mutex_lock(&g_lock);
         g_importing = 0;
         g_import_done = 1;
-        if (g_files_failed > 0)
-            snprintf(g_error_msg, sizeof(g_error_msg), "All files failed to copy.");
-        /* else: no music files found — not an error, just nothing to do */
         pthread_mutex_unlock(&g_lock);
         add_known(drive_name);
         free(drive_name);
@@ -633,7 +826,6 @@ static void *import_thread(void *arg) {
         sqlite3_busy_timeout(db, 10000);
         sqlite3_exec(db, "PRAGMA journal_mode=DELETE", NULL, NULL, NULL);
 
-        /* Take write lock with BEGIN IMMEDIATE */
         char *errmsg = NULL;
         if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, &errmsg) != SQLITE_OK) {
             pthread_mutex_lock(&g_lock);
@@ -648,7 +840,7 @@ static void *import_thread(void *arg) {
             return NULL;
         }
 
-        /* Backup AFTER acquiring write lock */
+        /* Backup */
         char backup[1024] = "";
         if (backup_database(db, db_path, backup, sizeof(backup)) != 0) {
             sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
@@ -656,7 +848,7 @@ static void *import_thread(void *arg) {
             g_importing = 0;
             g_import_done = 1;
             snprintf(g_error_msg, sizeof(g_error_msg),
-                "Backup failed — aborting import to protect your database.");
+                "Backup failed — aborting to protect your database.");
             pthread_mutex_unlock(&g_lock);
             sqlite3_close(db);
             free(drive_name);
@@ -666,7 +858,6 @@ static void *import_thread(void *arg) {
         snprintf(g_backup_path, sizeof(g_backup_path), "%s", backup);
         pthread_mutex_unlock(&g_lock);
 
-        /* Rotate old backups */
         rotate_backups(db_path, MAX_BACKUPS);
 
         /* Get originDatabaseUuid */
@@ -710,34 +901,49 @@ static void *import_thread(void *arg) {
             }
         }
 
-        /* Insert tracks */
+        /* Insert tracks with full metadata */
         int db_error = 0;
         int tracks_registered = 0;
         int next_otid = max_otid + 1;
 
         for (int i = 0; i < total_for_db && !db_error; i++) {
-            char esc_path[1024];
-            json_escape(esc_path, sizeof(esc_path), g_copied[i].rel_path);
+            /* Insert cover art if present */
+            int album_art_id = 0;
+            if (g_copied[i].cover_data && g_copied[i].cover_size > 0) {
+                /* Check if this cover hash already exists */
+                sqlite3_stmt *st = NULL;
+                if (sqlite3_prepare_v2(db, "SELECT id FROM AlbumArt WHERE hash=?",
+                    -1, &st, NULL) == SQLITE_OK) {
+                    sqlite3_bind_blob(st, 1, g_copied[i].cover_hash, 20, SQLITE_STATIC);
+                    if (sqlite3_step(st) == SQLITE_ROW)
+                        album_art_id = sqlite3_column_int(st, 0);
+                    sqlite3_finalize(st);
+                }
+                if (!album_art_id) {
+                    if (sqlite3_prepare_v2(db,
+                        "INSERT INTO AlbumArt (hash, albumArt) VALUES (?, ?)",
+                        -1, &st, NULL) == SQLITE_OK) {
+                        sqlite3_bind_blob(st, 1, g_copied[i].cover_hash, 20, SQLITE_STATIC);
+                        sqlite3_bind_blob(st, 2, g_copied[i].cover_data, g_copied[i].cover_size, SQLITE_STATIC);
+                        if (sqlite3_step(st) == SQLITE_DONE)
+                            album_art_id = (int)sqlite3_last_insert_rowid(db);
+                        sqlite3_finalize(st);
+                    }
+                }
+            }
 
-            char sql[2048];
-            snprintf(sql, sizeof(sql),
-                "INSERT OR IGNORE INTO Track "
-                "(path, filename, fileType, isAvailable, "
-                "originDatabaseUuid, originTrackId) "
-                "VALUES ('%s', '%s', '%s', 1, '%s', '%d')",
-                g_copied[i].rel_path,
-                strrchr(g_copied[i].rel_path, '/') ?
-                    strrchr(g_copied[i].rel_path, '/') + 1 : g_copied[i].rel_path,
-                g_copied[i].file_type,
-                uuid, next_otid);
-
-            /* Use proper parameter binding to avoid SQL injection */
+            /* Insert track with all metadata */
             sqlite3_stmt *st = NULL;
             const char *insert_sql =
                 "INSERT OR IGNORE INTO Track "
-                "(path, filename, fileType, isAvailable, "
+                "(path, filename, title, artist, album, genre, year, "
+                "length, bitrate, fileBytes, fileType, albumArtId, "
+                "isAnalyzed, isAvailable, isMetadataImported, "
+                "dateCreated, dateAdded, lastEditTime, "
                 "originDatabaseUuid, originTrackId) "
-                "VALUES (?, ?, ?, 1, ?, ?)";
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "0, 1, 1, strftime('%s','now'), strftime('%s','now'), "
+                "strftime('%s','now'), ?, ?)";
             if (sqlite3_prepare_v2(db, insert_sql, -1, &st, NULL) != SQLITE_OK) {
                 fprintf(stderr, "Prepare INSERT Track failed: %s\n", sqlite3_errmsg(db));
                 db_error = 1;
@@ -749,9 +955,52 @@ static void *import_thread(void *arg) {
 
             sqlite3_bind_text(st, 1, g_copied[i].rel_path, -1, SQLITE_STATIC);
             sqlite3_bind_text(st, 2, filename, -1, SQLITE_STATIC);
-            sqlite3_bind_text(st, 3, g_copied[i].file_type, -1, SQLITE_STATIC);
-            sqlite3_bind_text(st, 4, uuid, -1, SQLITE_STATIC);
-            sqlite3_bind_int(st, 5, next_otid);
+
+            if (g_copied[i].title[0])
+                sqlite3_bind_text(st, 3, g_copied[i].title, -1, SQLITE_STATIC);
+            else
+                sqlite3_bind_text(st, 3, filename, -1, SQLITE_STATIC);
+
+            if (g_copied[i].artist[0])
+                sqlite3_bind_text(st, 4, g_copied[i].artist, -1, SQLITE_STATIC);
+            else
+                sqlite3_bind_null(st, 4);
+
+            if (g_copied[i].album[0])
+                sqlite3_bind_text(st, 5, g_copied[i].album, -1, SQLITE_STATIC);
+            else
+                sqlite3_bind_null(st, 5);
+
+            if (g_copied[i].genre[0])
+                sqlite3_bind_text(st, 6, g_copied[i].genre, -1, SQLITE_STATIC);
+            else
+                sqlite3_bind_null(st, 6);
+
+            if (g_copied[i].year > 0)
+                sqlite3_bind_int(st, 7, g_copied[i].year);
+            else
+                sqlite3_bind_null(st, 7);
+
+            if (g_copied[i].duration > 0)
+                sqlite3_bind_int(st, 8, g_copied[i].duration);
+            else
+                sqlite3_bind_null(st, 8);
+
+            if (g_copied[i].bitrate > 0)
+                sqlite3_bind_int(st, 9, g_copied[i].bitrate);
+            else
+                sqlite3_bind_null(st, 9);
+
+            sqlite3_bind_int64(st, 10, g_copied[i].file_bytes);
+            sqlite3_bind_text(st, 11, g_copied[i].file_type, -1, SQLITE_STATIC);
+
+            if (album_art_id > 0)
+                sqlite3_bind_int(st, 12, album_art_id);
+            else
+                sqlite3_bind_null(st, 12);
+
+            sqlite3_bind_text(st, 13, uuid, -1, SQLITE_STATIC);
+            sqlite3_bind_int(st, 14, next_otid);
 
             int rc = sqlite3_step(st);
             sqlite3_finalize(st);
@@ -765,13 +1014,11 @@ static void *import_thread(void *arg) {
                 tracks_registered++;
                 next_otid++;
             }
-            /* SQLITE_CONSTRAINT = already exists, fine */
         }
 
         /* Create or find "USB Import" playlist */
         int playlist_id = 0;
-        if (!db_error && tracks_registered > 0) {
-            /* Check if playlist exists */
+        if (!db_error && total_for_db > 0) {
             sqlite3_stmt *st = NULL;
             if (sqlite3_prepare_v2(db,
                 "SELECT id FROM Playlist WHERE title='USB Import' LIMIT 1",
@@ -782,18 +1029,19 @@ static void *import_thread(void *arg) {
             }
 
             if (!playlist_id) {
-                /* Find last playlist in linked list */
                 int last_id = 0;
                 if (sqlite3_prepare_v2(db,
-                    "SELECT id FROM Playlist WHERE nextListId=0 ORDER BY id DESC LIMIT 1",
+                    "SELECT id FROM Playlist WHERE nextListId=0 AND parentListId=0 ORDER BY id DESC LIMIT 1",
                     -1, &st, NULL) == SQLITE_OK) {
                     if (sqlite3_step(st) == SQLITE_ROW)
                         last_id = sqlite3_column_int(st, 0);
                     sqlite3_finalize(st);
                 }
 
-                /* Insert new playlist */
-                const char *pl_sql = "INSERT INTO Playlist (title, nextListId) VALUES ('USB Import', 0)";
+                const char *pl_sql =
+                    "INSERT INTO Playlist (title, parentListId, nextListId, isPersisted, "
+                    "lastEditTime, isExplicitlyExported) "
+                    "VALUES ('USB Import', 0, 0, 1, strftime('%s','now'), 1)";
                 if (sqlite3_exec(db, pl_sql, NULL, NULL, &errmsg) != SQLITE_OK) {
                     fprintf(stderr, "INSERT Playlist failed: %s\n", errmsg ? errmsg : "?");
                     sqlite3_free(errmsg); errmsg = NULL;
@@ -801,26 +1049,19 @@ static void *import_thread(void *arg) {
                 }
                 if (!db_error) {
                     playlist_id = (int)sqlite3_last_insert_rowid(db);
-
-                    /* Link into chain */
                     if (last_id > 0) {
                         char link_sql[256];
                         snprintf(link_sql, sizeof(link_sql),
                             "UPDATE Playlist SET nextListId=%d WHERE id=%d",
                             playlist_id, last_id);
-                        if (sqlite3_exec(db, link_sql, NULL, NULL, &errmsg) != SQLITE_OK) {
-                            fprintf(stderr, "UPDATE Playlist chain failed: %s\n", errmsg ? errmsg : "?");
-                            sqlite3_free(errmsg); errmsg = NULL;
-                            db_error = 1;
-                        }
+                        sqlite3_exec(db, link_sql, NULL, NULL, NULL);
                     }
                 }
             }
         }
 
         /* Add tracks to playlist */
-        if (!db_error && playlist_id > 0 && tracks_registered > 0) {
-            /* Find last entity in this playlist */
+        if (!db_error && playlist_id > 0 && total_for_db > 0) {
             int last_entity = 0;
             {
                 sqlite3_stmt *st = NULL;
@@ -835,9 +1076,7 @@ static void *import_thread(void *arg) {
                 }
             }
 
-            /* Get originTrackIds for our newly inserted tracks */
             for (int i = 0; i < total_for_db && !db_error; i++) {
-                /* Look up the track's originTrackId by path */
                 sqlite3_stmt *st = NULL;
                 int otid = 0;
                 if (sqlite3_prepare_v2(db,
@@ -848,9 +1087,8 @@ static void *import_thread(void *arg) {
                         otid = sqlite3_column_int(st, 0);
                     sqlite3_finalize(st);
                 }
-                if (!otid) continue; /* track not in DB (shouldn't happen) */
+                if (!otid) continue;
 
-                /* Check if already in playlist */
                 int already = 0;
                 if (sqlite3_prepare_v2(db,
                     "SELECT 1 FROM PlaylistEntity WHERE listId=? AND trackId=?",
@@ -862,47 +1100,36 @@ static void *import_thread(void *arg) {
                 }
                 if (already) continue;
 
-                /* Insert playlist entity */
                 if (sqlite3_prepare_v2(db,
-                    "INSERT INTO PlaylistEntity (listId, trackId, nextEntityId) VALUES (?, ?, 0)",
+                    "INSERT INTO PlaylistEntity (listId, trackId, databaseUuid, nextEntityId, membershipReference) "
+                    "VALUES (?, ?, ?, 0, 1)",
                     -1, &st, NULL) == SQLITE_OK) {
                     sqlite3_bind_int(st, 1, playlist_id);
                     sqlite3_bind_int(st, 2, otid);
+                    sqlite3_bind_text(st, 3, uuid, -1, SQLITE_STATIC);
                     int rc = sqlite3_step(st);
                     int new_id = (int)sqlite3_last_insert_rowid(db);
                     sqlite3_finalize(st);
 
                     if (rc != SQLITE_DONE) {
-                        fprintf(stderr, "INSERT PlaylistEntity failed: %s\n", sqlite3_errmsg(db));
                         db_error = 1;
                         break;
                     }
 
-                    /* Link into chain */
                     if (last_entity > 0) {
                         char link_sql[256];
                         snprintf(link_sql, sizeof(link_sql),
                             "UPDATE PlaylistEntity SET nextEntityId=%d WHERE id=%d",
                             new_id, last_entity);
-                        if (sqlite3_exec(db, link_sql, NULL, NULL, &errmsg) != SQLITE_OK) {
-                            fprintf(stderr, "UPDATE PlaylistEntity chain failed: %s\n", errmsg ? errmsg : "?");
-                            sqlite3_free(errmsg); errmsg = NULL;
-                            db_error = 1;
-                            break;
-                        }
+                        sqlite3_exec(db, link_sql, NULL, NULL, NULL);
                     }
                     last_entity = new_id;
-                } else {
-                    fprintf(stderr, "Prepare PlaylistEntity failed: %s\n", sqlite3_errmsg(db));
-                    db_error = 1;
-                    break;
                 }
             }
         }
 
         /* Commit or rollback */
         if (db_error) {
-            fprintf(stderr, "Rolling back transaction\n");
             sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
             pthread_mutex_lock(&g_lock);
             g_importing = 0;
@@ -913,23 +1140,34 @@ static void *import_thread(void *arg) {
             sqlite3_close(db);
             add_known(drive_name);
             free(drive_name);
+            /* Free copied list */
+            for (int i = 0; i < g_copied_count; i++) {
+                free(g_copied[i].rel_path);
+                free(g_copied[i].file_type);
+                free(g_copied[i].cover_data);
+            }
+            g_copied_count = 0;
             return NULL;
         }
 
         if (sqlite3_exec(db, "COMMIT", NULL, NULL, &errmsg) != SQLITE_OK) {
-            fprintf(stderr, "COMMIT failed: %s\n", errmsg ? errmsg : "?");
             sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
             pthread_mutex_lock(&g_lock);
             g_importing = 0;
             g_import_done = 1;
             snprintf(g_error_msg, sizeof(g_error_msg),
-                "COMMIT failed: %s — rolled back. Backup at: %s",
-                errmsg ? errmsg : "unknown", backup);
+                "COMMIT failed: %s", errmsg ? errmsg : "unknown");
             pthread_mutex_unlock(&g_lock);
             sqlite3_free(errmsg);
             sqlite3_close(db);
             add_known(drive_name);
             free(drive_name);
+            for (int i = 0; i < g_copied_count; i++) {
+                free(g_copied[i].rel_path);
+                free(g_copied[i].file_type);
+                free(g_copied[i].cover_data);
+            }
+            g_copied_count = 0;
             return NULL;
         }
 
@@ -949,6 +1187,7 @@ static void *import_thread(void *arg) {
     for (int i = 0; i < g_copied_count; i++) {
         free(g_copied[i].rel_path);
         free(g_copied[i].file_type);
+        free(g_copied[i].cover_data);
     }
     g_copied_count = 0;
 
@@ -983,22 +1222,7 @@ static void handle_request(int fd) {
         char resp[4096];
         pthread_mutex_lock(&g_lock);
 
-        if (g_needs_target_selection && g_candidate_count > 0) {
-            /* Drive selection needed */
-            int pos = snprintf(resp, sizeof(resp),
-                "{\"select_target\":true,\"candidates\":[");
-            for (int i = 0; i < g_candidate_count; i++) {
-                char esc[512];
-                json_escape(esc, sizeof(esc), g_candidates[i]);
-                pos += snprintf(resp + pos, sizeof(resp) - pos,
-                    "%s\"%s\"", i ? "," : "", esc);
-            }
-            pos += snprintf(resp + pos, sizeof(resp) - pos,
-                "],\"saved_target\":\"%s\"}", g_saved_target);
-            pthread_mutex_unlock(&g_lock);
-            send_response(fd, 200, resp);
-
-        } else if (g_import_done) {
+        if (g_import_done) {
             char esc_err[512], esc_backup[512];
             json_escape(esc_err, sizeof(esc_err), g_error_msg);
             json_escape(esc_backup, sizeof(esc_backup), g_backup_path);
@@ -1007,10 +1231,7 @@ static void handle_request(int fd) {
                 "\"restart_pending\":%s,\"error\":\"%s\",\"backup\":\"%s\"}",
                 g_files_copied, g_files_skipped, g_files_failed,
                 g_restart_pending ? "true" : "false", esc_err, esc_backup);
-
-            /* Keep the done result until acknowledged */
             g_done_acked = 1;
-
             pthread_mutex_unlock(&g_lock);
             send_response(fd, 200, resp);
 
@@ -1056,14 +1277,34 @@ static void handle_request(int fd) {
             send_response(fd, 400, "{\"error\":\"invalid drive name\"}");
         } else {
             pthread_mutex_lock(&g_lock);
-            /* Check that this is the currently pending drive */
-            if (strcmp(drive, g_pending_drive) != 0) {
-                pthread_mutex_unlock(&g_lock);
-                send_response(fd, 400, "{\"error\":\"not the pending drive\"}");
+            int has_target = g_internal_root[0] != 0;
+            pthread_mutex_unlock(&g_lock);
+
+            if (!has_target) {
+                /* Need target selection — return candidates */
+                char candidates[MAX_CANDIDATES][256];
+                int ncan = find_engine_drives(candidates, MAX_CANDIDATES);
+                int non_usb = filter_non_usb(candidates, ncan);
+
+                char resp[4096];
+                int pos = snprintf(resp, sizeof(resp),
+                    "{\"needs_target\":true,\"candidates\":[");
+                /* Show non-USB drives first, then all if none */
+                int show_count = non_usb > 0 ? non_usb : ncan;
+                char (*show)[256] = candidates;
+                for (int i = 0; i < show_count; i++) {
+                    char esc[512];
+                    json_escape(esc, sizeof(esc), show[i]);
+                    pos += snprintf(resp + pos, sizeof(resp) - pos,
+                        "%s\"%s\"", i ? "," : "", esc);
+                }
+                pos += snprintf(resp + pos, sizeof(resp) - pos, "]}");
+                send_response(fd, 200, resp);
             } else if (g_importing) {
-                pthread_mutex_unlock(&g_lock);
                 send_response(fd, 409, "{\"error\":\"import already in progress\"}");
             } else {
+                /* Start import */
+                pthread_mutex_lock(&g_lock);
                 g_importing = 1;
                 g_import_done = 0;
                 g_files_copied = 0;
@@ -1099,7 +1340,6 @@ static void handle_request(int fd) {
         send_response(fd, 200, "{\"ok\":true}");
 
     } else if (strstr(buf, "POST /api/ack")) {
-        /* Client acknowledges seeing the done result — clear state */
         pthread_mutex_lock(&g_lock);
         if (g_import_done && g_done_acked) {
             g_import_done = 0;
@@ -1125,11 +1365,10 @@ static void handle_request(int fd) {
             send_response(fd, 200, "{\"ok\":true}");
         } else {
             pthread_mutex_unlock(&g_lock);
-            send_response(fd, 200, "{\"ok\":false,\"reason\":\"no restart pending\"}");
+            send_response(fd, 200, "{\"ok\":false}");
         }
 
     } else if (strstr(buf, "POST /api/later")) {
-        /* User chose "Later" — clear restart_pending so scanning resumes */
         pthread_mutex_lock(&g_lock);
         g_restart_pending = 0;
         g_import_done = 0;
@@ -1137,7 +1376,6 @@ static void handle_request(int fd) {
         send_response(fd, 200, "{\"ok\":true}");
 
     } else if (strstr(buf, "POST /api/select-target")) {
-        /* User selected their target drive */
         char *dj = strstr(buf, "\"drive\"");
         char drive[256] = "";
         int remember = 0;
@@ -1159,8 +1397,6 @@ static void handle_request(int fd) {
         } else {
             pthread_mutex_lock(&g_lock);
             snprintf(g_internal_root, sizeof(g_internal_root), "/media/%s", drive);
-            g_needs_target_selection = 0;
-            g_candidate_count = 0;
             pthread_mutex_unlock(&g_lock);
 
             if (remember) save_target(drive);
@@ -1170,13 +1406,11 @@ static void handle_request(int fd) {
         }
 
     } else if (strstr(buf, "POST /api/reset-target")) {
-        /* Reset saved target — next scan will trigger selection */
         unlink(CONFIG_PATH);
         pthread_mutex_lock(&g_lock);
         g_saved_target[0] = 0;
         g_internal_root[0] = 0;
         pthread_mutex_unlock(&g_lock);
-        fprintf(stderr, "Target drive config reset\n");
         send_response(fd, 200, "{\"ok\":true}");
 
     } else {
@@ -1193,69 +1427,37 @@ static void *poll_thread(void *arg) {
         sleep(POLL_INTERVAL);
         pthread_mutex_lock(&g_lock);
         int busy = g_importing || g_pending_drive[0] ||
-                   (g_import_done && !g_done_acked) || g_needs_target_selection;
+                   (g_import_done && !g_done_acked);
         pthread_mutex_unlock(&g_lock);
         if (busy) continue;
 
         purge_unmounted_known();
 
-        /* Find drives with Engine Library */
-        char candidates[MAX_CANDIDATES][256];
-        int ncan = find_engine_drives(candidates, MAX_CANDIDATES);
-
-        /* Filter USB drives */
-        int non_usb = filter_non_usb(candidates, ncan);
-
-        /* Determine internal drive */
+        /* Auto-detect internal drive if saved target configured */
         pthread_mutex_lock(&g_lock);
-
         if (g_saved_target[0]) {
-            /* Check if saved target is still mounted */
             char check[1024];
             snprintf(check, sizeof(check), "/media/%s/Engine Library/Database2/m.db", g_saved_target);
             struct stat st;
-            if (stat(check, &st) == 0) {
+            if (stat(check, &st) == 0)
                 snprintf(g_internal_root, sizeof(g_internal_root), "/media/%s", g_saved_target);
-            } else {
-                /* Saved target gone — need reselection */
+            else
                 g_internal_root[0] = 0;
-                if (non_usb > 0) {
-                    g_needs_target_selection = 1;
-                    g_candidate_count = non_usb;
-                    for (int i = 0; i < non_usb && i < MAX_CANDIDATES; i++)
-                        snprintf(g_candidates[i], 256, "%s", candidates[i]);
-                    pthread_mutex_unlock(&g_lock);
-                    continue;
-                }
-            }
-        } else if (non_usb == 1) {
-            /* Exactly one non-USB drive — use it automatically */
-            snprintf(g_internal_root, sizeof(g_internal_root), "/media/%s", candidates[0]);
-        } else if (non_usb > 1) {
-            /* Multiple candidates — ask user to choose */
-            g_needs_target_selection = 1;
-            g_candidate_count = non_usb;
-            for (int i = 0; i < non_usb && i < MAX_CANDIDATES; i++)
-                snprintf(g_candidates[i], 256, "%s", candidates[i]);
+        } else if (!g_internal_root[0]) {
+            /* Auto-detect if only one non-USB Engine drive exists */
+            char candidates[MAX_CANDIDATES][256];
             pthread_mutex_unlock(&g_lock);
-            continue;
-        } else if (non_usb == 0 && ncan > 0) {
-            /* All drives are USB — still ask, maybe user wants one */
-            g_needs_target_selection = 1;
-            g_candidate_count = ncan;
-            for (int i = 0; i < ncan && i < MAX_CANDIDATES; i++)
-                snprintf(g_candidates[i], 256, "%s", candidates[i]);
-            pthread_mutex_unlock(&g_lock);
-            continue;
+            int ncan = find_engine_drives(candidates, MAX_CANDIDATES);
+            int non_usb = filter_non_usb(candidates, ncan);
+            pthread_mutex_lock(&g_lock);
+            if (non_usb == 1)
+                snprintf(g_internal_root, sizeof(g_internal_root), "/media/%s", candidates[0]);
         }
-
         char internal[1024];
         snprintf(internal, sizeof(internal), "%s", g_internal_root);
         pthread_mutex_unlock(&g_lock);
 
-        if (!internal[0]) continue;
-
-        /* Now scan for USB drives to offer import */
+        /* Scan for USB drives to offer import */
         DIR *d = opendir("/media");
         if (!d) continue;
         struct dirent *e;
@@ -1266,13 +1468,10 @@ static void *poll_thread(void *arg) {
             snprintf(mp, sizeof(mp), "/media/%s", e->d_name);
 
             /* Skip the internal drive */
-            if (strcmp(mp, internal) == 0) continue;
+            if (internal[0] && strcmp(mp, internal) == 0) continue;
 
-            /* Skip known drives */
             if (is_known(e->d_name)) continue;
 
-            /* Check if this drive has music files (quick scan: just check top level and one level deep) */
-            /* For now, any mounted drive that isn't the internal drive is offered */
             struct stat st;
             if (stat(mp, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
 
@@ -1293,9 +1492,8 @@ static void *poll_thread(void *arg) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
-    fprintf(stderr, "USB Import daemon v7.0 on port %d\n", PORT);
+    fprintf(stderr, "USB Import daemon v8.0 on port %d\n", PORT);
 
-    /* Load saved target preference */
     load_saved_target();
     if (g_saved_target[0])
         fprintf(stderr, "Saved target drive: %s\n", g_saved_target);
