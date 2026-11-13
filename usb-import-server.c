@@ -365,6 +365,7 @@ static void purge_unmounted_known(void) {
         snprintf(path, sizeof(path), "/media/%s", g_known[i]);
         struct stat st;
         if (stat(path, &st) != 0) {
+            fprintf(stderr, "Purged known drive: %s\n", g_known[i]);
             g_known_count--;
             memmove(g_known[i], g_known[g_known_count], 256);
         } else {
@@ -1330,13 +1331,16 @@ static void handle_request(int fd) {
         }
 
     } else if (strstr(buf, "POST /api/dismiss")) {
+        char dismissed[256] = {0};
         pthread_mutex_lock(&g_lock);
         if (g_pending_drive[0]) {
-            add_known(g_pending_drive);
+            snprintf(dismissed, sizeof(dismissed), "%s", g_pending_drive);
             g_pending_drive[0] = 0;
             g_pending_path[0] = 0;
         }
         pthread_mutex_unlock(&g_lock);
+        if (dismissed[0])
+            add_known(dismissed);
         send_response(fd, 200, "{\"ok\":true}");
 
     } else if (strstr(buf, "POST /api/ack")) {
